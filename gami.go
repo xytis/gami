@@ -91,6 +91,7 @@ type AMIClient struct {
 	address     string
 	amiUser     string
 	amiPass     string
+	amiAuth     bool
 	useTLS      bool
 	unsecureTLS bool
 
@@ -127,14 +128,6 @@ type AMIEvent struct {
 	Params map[string]string
 }
 
-func UseTLS(c *AMIClient) {
-	c.useTLS = true
-}
-
-func UnsecureTLS(c *AMIClient) {
-	c.unsecureTLS = true
-}
-
 // Login authenticate to AMI
 func (client *AMIClient) Login(username, password string) error {
 	response, err := client.Action("Login", Params{"Username": username, "Secret": password})
@@ -148,29 +141,27 @@ func (client *AMIClient) Login(username, password string) error {
 
 	client.amiUser = username
 	client.amiPass = password
+	client.amiAuth = true
 	return nil
 }
 
-// Reconnect the session, autologin if a new network error it put on client.NetError
-func (client *AMIClient) Reconnect() error {
+// Reconnect the session, autologin if possible
+func (client *AMIClient) Reconnect() (err error) {
 	client.conn.Close()
-	err := client.NewConn()
-
-	if err != nil {
-		client.NetError <- err
+	if client.conn, err = client.newConn(); err != nil {
 		return err
 	}
 
-	client.waitNewConnection <- struct{}{}
-
-	if err := client.Login(client.amiUser, client.amiPass); err != nil {
-		return err
+	if client.amiAuth {
+		if err = client.Login(client.amiUser, client.amiPass); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-// AsyncAction return chan for wait response of action with parameter *ActionID* this can be helpful for
+// AsyncAction returns chan for wait response of action with parameter *ActionID* this can be helpful for
 // massive actions,
 func (client *AMIClient) AsyncAction(action string, params Params) (<-chan *AMIResponse, error) {
 	if err := client.conn.PrintfLine("Action: %s", strings.TrimSpace(action)); err != nil {
@@ -287,8 +278,8 @@ func newEvent(data *textproto.MIMEHeader) (*AMIEvent, error) {
 }
 
 // Dial create a new connection to AMI
-func Dial(address string, options ...func(*AMIClient)) (*AMIClient, error) {
-	client := &AMIClient{
+func Dial(address string, options ...func(*AMIClient)) (client *AMIClient, err error) {
+	client = &AMIClient{
 		address:           address,
 		amiUser:           "",
 		amiPass:           "",
@@ -303,34 +294,34 @@ func Dial(address string, options ...func(*AMIClient)) (*AMIClient, error) {
 	for _, op := range options {
 		op(client)
 	}
-	err := client.NewConn()
-	if err != nil {
+	if client.conn, err = client.newConn(); err != nil {
 		return nil, err
 	}
 	return client, nil
 }
 
 // NewConn create a new connection to AMI
-func (client *AMIClient) NewConn() (err error) {
+func (client *AMIClient) newConn() (conn *textproto.Conn, err error) {
+	var rwc io.ReadWriteCloser
 	if client.useTLS {
-		client.connRaw, err = tls.Dial("tcp", client.address, &tls.Config{InsecureSkipVerify: client.unsecureTLS})
+		rwc, err = tls.Dial("tcp", client.address, &tls.Config{InsecureSkipVerify: client.unsecureTLS})
 	} else {
-		client.connRaw, err = net.Dial("tcp", client.address)
+		rwc, err = net.Dial("tcp", client.address)
 	}
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	client.conn = textproto.NewConn(client.connRaw)
-	label, err := client.conn.ReadLine()
+	conn = textproto.NewConn(rwc)
+	label, err := conn.ReadLine()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if strings.Contains(label, "Asterisk Call Manager") != true {
-		return ErrNotAMI
+		return nil, ErrNotAMI
 	}
 
-	return nil
+	return conn, nil
 }
