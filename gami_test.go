@@ -13,9 +13,7 @@ func InitRunClose(url string, tb testing.TB, fn func(*gami.AMIClient)) {
 		tb.Fatal(err)
 	}
 	defer func() {
-		fmt.Println("Closing")
 		ami.Close()
-		fmt.Println("Closed")
 	}()
 	if fn != nil {
 		fn(ami)
@@ -41,31 +39,47 @@ func GetCredentials() (user string, pass string) {
 	}
 	return user, pass
 }
-
-func Login(tb testing.TB, client *gami.AMIClient) {
+func Login(client *gami.AMIClient) error {
 	user, pass := GetCredentials()
-	if err := client.Login(user, pass); err != nil {
-		fmt.Println("fatal")
-		tb.Fatal(err)
-	}
+	return client.Login(user, pass)
 }
 
 /*
 func TestInitiation(t *testing.T) {
 	InitRunClose(GetUrl(), t, nil)
 }
-*/
 
 func TestSeveralCommands(t *testing.T) {
 	InitRunClose(GetUrl(), t, func(client *gami.AMIClient) {
-		Login(t, client)
-
-		if rs, err := client.Action("ListCommands", nil); err != nil {
+		if err := Login(client); err != nil {
 			t.Fatal(err)
-		} else {
-			fmt.Println("response", rs)
+		}
+
+		if _, err := client.Action("ListCommands", nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.Action("ListCommands", nil); err != nil {
+			t.Fatal(err)
 		}
 	})
+}
+*/
+
+func TestReconnection(t *testing.T) {
+	fmt.Println("Rec1")
+	url := GetUrl()
+	ami, err := gami.Dial(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ami.Close()
+	fmt.Println("Rec2")
+	ami.Reconnect()
+	fmt.Println("Rec3")
+	Login(ami)
+	fmt.Println("Rec4")
+	ami.Reconnect()
+	fmt.Println("Rec5")
 }
 
 func BenchmarkInitRunClose(b *testing.B) {
@@ -74,4 +88,17 @@ func BenchmarkInitRunClose(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		InitRunClose(url, b, nil)
 	}
+}
+
+func BenchmarkOperations(b *testing.B) {
+	url := GetUrl()
+	b.ReportAllocs()
+	InitRunClose(url, b, func(client *gami.AMIClient) {
+		if err := Login(client); err != nil {
+			b.Fatal(err)
+		}
+		for i := 0; i < b.N; i++ {
+			client.Action("Ping", nil)
+		}
+	})
 }

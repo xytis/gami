@@ -1,81 +1,16 @@
-// Package gami provites primitives for interacting with Asterisk AMI
-/*
-
-Basic Usage
-
-
-	ami, err := gami.Dial("127.0.0.1:5038")
-	if err != nil {
-		fmt.Print(err)
-		os.Exit(1)
-	}
-	ami.Run()
-	defer ami.Close()
-
-	//install manager
-	go func() {
-		for {
-			select {
-			//handle network errors
-			case err := <-ami.NetError:
-				log.Println("Network Error:", err)
-				//try new connection every second
-				<-time.After(time.Second)
-				if err := ami.Reconnect(); err == nil {
-					//call start actions
-					ami.Action("Events", gami.Params{"EventMask": "on"})
-				}
-
-
-			case err := <-ami.Error:
-				log.Println("error:", err)
-			//wait events and process
-			case ev := <-ami.Events:
-				log.Println("Event Detect: %v", *ev)
-				//if want type of events
-				log.Println("EventType:", event.New(ev))
-			}
-		}
-	}()
-
-	if err := ami.Login("admin", "root"); err != nil {
-		log.Fatal(err)
-	}
-
-
-	if rs, err = ami.Action("Ping", nil); err == nil {
-		log.Fatal(rs)
-	}
-
-	//or with can do async
-	pingResp, pingErr := ami.AsyncAction("Ping", gami.Params{"ActionID": "miping"})
-	if pingErr != nil {
-		log.Fatal(pingErr)
-	}
-
-	if rs, err = ami.Action("Events", ami.Params{"EventMask":"on"}); err != nil {
-		fmt.Print(err)
-	}
-
-	log.Println("future ping:", <-pingResp)
-
-
-*/
 package gami
 
 import (
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/textproto"
+	"strconv"
 	"strings"
 	"syscall"
 )
-
-const responseChanGamiID = "gamigeneral"
-
-var errNotEvent = errors.New("Not Event")
 
 // Raise when not response expected protocol AMI
 var ErrNotAMI = errors.New("Server not AMI interface")
@@ -85,8 +20,7 @@ type Params map[string]string
 
 // AMIClient a connection to AMI server
 type AMIClient struct {
-	conn    *textproto.Conn
-	connRaw io.ReadWriteCloser
+	conn *textproto.Conn
 
 	address     string
 	amiUser     string
@@ -94,9 +28,10 @@ type AMIClient struct {
 	amiAuth     bool
 	useTLS      bool
 	unsecureTLS bool
+	opNumber    int
+	opPrefix    string
 
-	// network wait for a new connection
-	waitNewConnection chan struct{}
+	done chan struct{}
 
 	response map[string]chan *AMIResponse
 
@@ -126,6 +61,185 @@ type AMIEvent struct {
 
 	// Params  of arguments received
 	Params map[string]string
+}
+
+// AsyncAction returns chan for wait response of action with parameter *ActionID* this can be helpful for
+// massive actions,
+func (client *AMIClient) AsyncAction(action string, params Params) (<-chan *AMIResponse, error) {
+	if params == nil {
+		params = Params{}
+	}
+
+	if _, ok := params["ActionID"]; !ok {
+		params["ActionID"] = client.opPrefix + strconv.Itoa(client.opNumber)
+		client.opNumber += 1
+	}
+
+	if err := client.conn.PrintfLine("Action: %s", strings.TrimSpace(action)); err != nil {
+		return nil, err
+	}
+
+	if _, ok := client.response[params["ActionID"]]; !ok {
+		client.response[params["ActionID"]] = make(chan *AMIResponse, 1)
+	}
+
+	for k, v := range params {
+		if err := client.conn.PrintfLine("%s: %s", k, strings.TrimSpace(v)); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := client.conn.PrintfLine(""); err != nil {
+		return nil, err
+	}
+
+	return client.response[params["ActionID"]], nil
+}
+
+// Action send with params
+func (client *AMIClient) Action(action string, params Params) (*AMIResponse, error) {
+	resp, err := client.AsyncAction(action, params)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Println("Rec01")
+	select {
+	case response := <-resp:
+		fmt.Println("Rec02")
+		return response, nil
+	case <-client.done:
+		fmt.Println("Rec03")
+		return nil, errors.New("may not send action on closed pipeline")
+	}
+}
+
+func handleConnection(conn *textproto.Conn, done <-chan struct{}) (chan textproto.MIMEHeader, chan error) {
+	datap := make(chan textproto.MIMEHeader)
+	errp := make(chan error)
+	go func() {
+		defer func() {
+			close(datap)
+			close(errp)
+		}()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				if data, err := conn.ReadMIMEHeader(); err != nil {
+					errp <- err
+					return
+				} else {
+					datap <- data
+				}
+			}
+		}
+	}()
+	return datap, errp
+}
+
+// Run process socket waiting events and responses
+func (client *AMIClient) run() {
+	datap, errp := handleConnection(client.conn, client.done)
+	go func() {
+		for err := range errp {
+			fmt.Println("connection error", err)
+			switch err {
+			case syscall.ECONNABORTED:
+				fallthrough
+			case syscall.ECONNRESET:
+				fallthrough
+			case syscall.ECONNREFUSED:
+				fallthrough
+			case io.EOF:
+				client.conn.Close()
+				client.NetError <- err
+			default:
+				client.Error <- err
+			}
+		}
+	}()
+	go func() {
+		for data := range datap {
+			if data.Get("Response") != "" {
+				if response, err := newResponse(&data); err == nil {
+					client.response[response.ID] <- response
+					close(client.response[response.ID])
+					delete(client.response, response.ID)
+				} else {
+					client.Error <- err
+				}
+			}
+			if data.Get("Event") != "" {
+				if event, err := newEvent(&data); err == nil {
+					client.Events <- event
+				} else {
+					client.Error <- err
+				}
+			}
+		}
+	}()
+}
+
+//newResponse build a response for action
+func newResponse(data *textproto.MIMEHeader) (*AMIResponse, error) {
+	if data.Get("Response") == "" {
+		return nil, errors.New("Not Response")
+	}
+	response := &AMIResponse{"", "", make(map[string]string)}
+	for k, v := range *data {
+		if k == "Response" {
+			continue
+		}
+		if k == "Actionid" {
+			continue
+		}
+		response.Params[k] = v[0]
+	}
+	response.ID = data.Get("Actionid")
+	response.Status = data.Get("Response")
+	return response, nil
+}
+
+//newEvent build event
+func newEvent(data *textproto.MIMEHeader) (*AMIEvent, error) {
+	if data.Get("Event") == "" {
+		return nil, errors.New("Not Event")
+	}
+	ev := &AMIEvent{data.Get("Event"), strings.Split(data.Get("Privilege"), ","), make(map[string]string)}
+	for k, v := range *data {
+		if k == "Event" || k == "Privilege" {
+			continue
+		}
+		ev.Params[k] = v[0]
+	}
+	return ev, nil
+}
+
+// Dial create a new connection to AMI
+func Dial(address string, options ...func(*AMIClient)) (client *AMIClient, err error) {
+	client = &AMIClient{
+		address:     address,
+		amiUser:     "",
+		amiPass:     "",
+		opNumber:    0,
+		opPrefix:    "r",
+		done:        make(chan struct{}),
+		response:    make(map[string]chan *AMIResponse),
+		Events:      make(chan *AMIEvent, 100),
+		Error:       make(chan error, 1),
+		NetError:    make(chan error, 1),
+		useTLS:      false,
+		unsecureTLS: false,
+	}
+	for _, op := range options {
+		op(client)
+	}
+	if client.conn, err = client.newConn(); err != nil {
+		return nil, err
+	}
+	client.run()
+	return client, nil
 }
 
 // Login authenticate to AMI
@@ -158,146 +272,16 @@ func (client *AMIClient) Reconnect() (err error) {
 		}
 	}
 
+	client.run()
+
 	return nil
-}
-
-// AsyncAction returns chan for wait response of action with parameter *ActionID* this can be helpful for
-// massive actions,
-func (client *AMIClient) AsyncAction(action string, params Params) (<-chan *AMIResponse, error) {
-	if err := client.conn.PrintfLine("Action: %s", strings.TrimSpace(action)); err != nil {
-		return nil, err
-	}
-
-	if _, ok := params["ActionID"]; ok {
-		params["ActionID"] = responseChanGamiID
-	}
-
-	if _, ok := client.response[params["ActionID"]]; !ok {
-		client.response[params["ActionID"]] = make(chan *AMIResponse, 1)
-	}
-
-	for k, v := range params {
-		if err := client.conn.PrintfLine("%s: %s", k, strings.TrimSpace(v)); err != nil {
-			return nil, err
-		}
-	}
-
-	if err := client.conn.PrintfLine(""); err != nil {
-		return nil, err
-	}
-
-	return client.response[params["ActionID"]], nil
-}
-
-// Action send with params
-func (client *AMIClient) Action(action string, params Params) (*AMIResponse, error) {
-	resp, err := client.AsyncAction(action, params)
-	if err != nil {
-		return nil, err
-	}
-	response := <-resp
-
-	return response, nil
-}
-
-// Run process socket waiting events and responses
-func (client *AMIClient) Run() {
-	go func() {
-		for {
-			data, err := client.conn.ReadMIMEHeader()
-
-			if err != nil {
-				switch err {
-				case syscall.ECONNABORTED:
-					fallthrough
-				case syscall.ECONNRESET:
-					fallthrough
-				case syscall.ECONNREFUSED:
-					fallthrough
-				case io.EOF:
-					client.NetError <- err
-					<-client.waitNewConnection
-				default:
-					client.Error <- err
-				}
-				continue
-			}
-
-			if ev, err := newEvent(&data); err != nil {
-				if err != errNotEvent {
-					client.Error <- err
-				}
-			} else {
-				client.Events <- ev
-			}
-
-			if response, err := newResponse(&data); err == nil {
-				client.response[response.ID] <- response
-			}
-
-		}
-	}()
 }
 
 // Close the connection to AMI
 func (client *AMIClient) Close() {
 	client.Action("Logoff", nil)
-	(client.connRaw).Close()
-}
-
-//newResponse build a response for action
-func newResponse(data *textproto.MIMEHeader) (*AMIResponse, error) {
-	if data.Get("Response") == "" {
-		return nil, errors.New("Not Response")
-	}
-	response := &AMIResponse{"", "", make(map[string]string)}
-	for k, v := range *data {
-		if k == "Response" {
-			continue
-		}
-		response.Params[k] = v[0]
-	}
-	response.ID = data.Get("Actionid")
-	response.Status = data.Get("Response")
-	return response, nil
-}
-
-//newEvent build event
-func newEvent(data *textproto.MIMEHeader) (*AMIEvent, error) {
-	if data.Get("Event") == "" {
-		return nil, errNotEvent
-	}
-	ev := &AMIEvent{data.Get("Event"), strings.Split(data.Get("Privilege"), ","), make(map[string]string)}
-	for k, v := range *data {
-		if k == "Event" || k == "Privilege" {
-			continue
-		}
-		ev.Params[k] = v[0]
-	}
-	return ev, nil
-}
-
-// Dial create a new connection to AMI
-func Dial(address string, options ...func(*AMIClient)) (client *AMIClient, err error) {
-	client = &AMIClient{
-		address:           address,
-		amiUser:           "",
-		amiPass:           "",
-		waitNewConnection: make(chan struct{}),
-		response:          make(map[string]chan *AMIResponse),
-		Events:            make(chan *AMIEvent, 100),
-		Error:             make(chan error, 1),
-		NetError:          make(chan error, 1),
-		useTLS:            false,
-		unsecureTLS:       false,
-	}
-	for _, op := range options {
-		op(client)
-	}
-	if client.conn, err = client.newConn(); err != nil {
-		return nil, err
-	}
-	return client, nil
+	client.conn.Close()
+	close(client.done)
 }
 
 // NewConn create a new connection to AMI
