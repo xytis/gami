@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // Raise when not response expected protocol AMI
@@ -31,17 +32,13 @@ type AMIClient struct {
 	opNumber    int
 	opPrefix    string
 
-	done chan struct{}
-
+	raw      chan textproto.MIMEHeader
+	closing  chan chan error
+	events   chan *AMIEvent
+	errors   chan error
 	response map[string]chan *AMIResponse
 
-	// Events for client parse
-	Events chan *AMIEvent
-
-	// Error Raise on logic
-	Error chan error
-
-	//NetError a network error
+	Error    chan error
 	NetError chan error
 }
 
@@ -49,18 +46,20 @@ type AMIClient struct {
 type AMIResponse struct {
 	ID     string
 	Status string
-	Params map[string]string
+	Params Params
+}
+
+// AMIAction
+type AMIAction struct {
+	Response chan AMIResponse
+	Error    chan error
 }
 
 // AMIEvent it's a representation of Event readed
 type AMIEvent struct {
-	//Identification of event Event: xxxx
-	ID string
-
+	ID        string
 	Privilege []string
-
-	// Params  of arguments received
-	Params map[string]string
+	Params    Params
 }
 
 // AsyncAction returns chan for wait response of action with parameter *ActionID* this can be helpful for
@@ -80,7 +79,7 @@ func (client *AMIClient) AsyncAction(action string, params Params) (<-chan *AMIR
 	}
 
 	if _, ok := client.response[params["ActionID"]]; !ok {
-		client.response[params["ActionID"]] = make(chan *AMIResponse, 1)
+		client.response[params["ActionID"]] = make(chan *AMIResponse)
 	}
 
 	for k, v := range params {
@@ -102,47 +101,99 @@ func (client *AMIClient) Action(action string, params Params) (*AMIResponse, err
 	if err != nil {
 		return nil, err
 	}
-	fmt.Println("Rec01")
 	select {
 	case response := <-resp:
-		fmt.Println("Rec02")
 		return response, nil
-	case <-client.done:
-		fmt.Println("Rec03")
-		return nil, errors.New("may not send action on closed pipeline")
+	case <-time.After(time.Second * 5):
+		return nil, errors.New("operation timed out")
 	}
 }
 
-func handleConnection(conn *textproto.Conn, done <-chan struct{}) (chan textproto.MIMEHeader, chan error) {
-	datap := make(chan textproto.MIMEHeader)
-	errp := make(chan error)
+func (client *AMIClient) handleConnection(conn *textproto.Conn) {
+	client.raw = make(chan textproto.MIMEHeader)
 	go func() {
 		defer func() {
-			close(datap)
-			close(errp)
+			close(client.raw)
 		}()
 		for {
-			select {
-			case <-done:
+			if data, err := conn.ReadMIMEHeader(); err != nil {
+				client.errors <- err
 				return
-			default:
-				if data, err := conn.ReadMIMEHeader(); err != nil {
-					errp <- err
-					return
-				} else {
-					datap <- data
-				}
+			} else {
+				client.raw <- data
 			}
 		}
 	}()
-	return datap, errp
 }
 
 // Run process socket waiting events and responses
 func (client *AMIClient) run() {
-	datap, errp := handleConnection(client.conn, client.done)
+
+	//Chomping proc for printing runtime errors encountered
 	go func() {
-		for err := range errp {
+		for {
+			select {
+			case err, ok := <-client.errors:
+				if !ok {
+					return
+				}
+				fmt.Println(err)
+			}
+		}
+	}()
+
+	go func() {
+		var pendingEvent []*AMIEvent
+		var pendingError []error
+		for {
+			var currentEvent *AMIEvent
+			var currentError error
+			var events chan *AMIEvent
+			var errors chan error
+			if len(pendingEvent) > 0 {
+				currentEvent = pendingEvent[0]
+				events = client.events
+			}
+			if len(pendingError) > 0 {
+				currentError = pendingError[0]
+				errors = client.errors
+			}
+			select {
+			case errc := <-client.closing:
+				errc <- currentError
+				close(client.raw)
+				close(client.errors)
+				close(client.events)
+				return
+			case data := <-client.raw:
+				if data.Get("Response") != "" {
+					if response, err := newResponse(&data); err == nil {
+						//TODO: will block whole server on bad consume
+						client.response[response.ID] <- response
+						close(client.response[response.ID])
+						delete(client.response, response.ID)
+					} else {
+						pendingError = append(pendingError, err)
+					}
+				}
+				if data.Get("Event") != "" {
+					if event, err := newEvent(&data); err == nil {
+						pendingEvent = append(pendingEvent, event)
+					} else {
+						pendingError = append(pendingError, err)
+					}
+				}
+			case events <- currentEvent:
+				pendingEvent = pendingEvent[1:]
+			case errors <- currentError:
+				pendingError = pendingError[1:]
+			}
+		}
+	}()
+
+	client.handleConnection(client.conn)
+	go func() {
+		for err := range client.errors {
 			fmt.Println("connection error", err)
 			switch err {
 			case syscall.ECONNABORTED:
@@ -159,26 +210,6 @@ func (client *AMIClient) run() {
 			}
 		}
 	}()
-	go func() {
-		for data := range datap {
-			if data.Get("Response") != "" {
-				if response, err := newResponse(&data); err == nil {
-					client.response[response.ID] <- response
-					close(client.response[response.ID])
-					delete(client.response, response.ID)
-				} else {
-					client.Error <- err
-				}
-			}
-			if data.Get("Event") != "" {
-				if event, err := newEvent(&data); err == nil {
-					client.Events <- event
-				} else {
-					client.Error <- err
-				}
-			}
-		}
-	}()
 }
 
 //newResponse build a response for action
@@ -186,18 +217,23 @@ func newResponse(data *textproto.MIMEHeader) (*AMIResponse, error) {
 	if data.Get("Response") == "" {
 		return nil, errors.New("Not Response")
 	}
-	response := &AMIResponse{"", "", make(map[string]string)}
-	for k, v := range *data {
-		if k == "Response" {
-			continue
-		}
-		if k == "Actionid" {
-			continue
-		}
-		response.Params[k] = v[0]
+	response := &AMIResponse{
+		ID:     "",
+		Status: "",
+		Params: make(map[string]string),
 	}
-	response.ID = data.Get("Actionid")
-	response.Status = data.Get("Response")
+	for k, v := range *data {
+		//Allways operate on first value
+		fv := v[0]
+		switch {
+		case k == "Response":
+			response.Status = fv
+		case k == "Actionid":
+			response.ID = fv
+		default:
+			response.Params[k] = fv
+		}
+	}
 	return response, nil
 }
 
@@ -224,9 +260,8 @@ func Dial(address string, options ...func(*AMIClient)) (client *AMIClient, err e
 		amiPass:     "",
 		opNumber:    0,
 		opPrefix:    "r",
-		done:        make(chan struct{}),
 		response:    make(map[string]chan *AMIResponse),
-		Events:      make(chan *AMIEvent, 100),
+		events:      make(chan *AMIEvent),
 		Error:       make(chan error, 1),
 		NetError:    make(chan error, 1),
 		useTLS:      false,
@@ -278,10 +313,11 @@ func (client *AMIClient) Reconnect() (err error) {
 }
 
 // Close the connection to AMI
-func (client *AMIClient) Close() {
+func (client *AMIClient) Close() error {
 	client.Action("Logoff", nil)
-	client.conn.Close()
-	close(client.done)
+	errc := make(chan error)
+	client.closing <- errc
+	return <-errc
 }
 
 // NewConn create a new connection to AMI
