@@ -5,7 +5,6 @@ import (
 	"testing"
 )
 
-//Util para hacer pruebas de eventos
 func testEvent(t *testing.T, fixture map[string]string, evtype interface{}) {
 	value := reflect.ValueOf(evtype)
 	typ := reflect.TypeOf(evtype)

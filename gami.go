@@ -3,7 +3,6 @@ package gami
 import (
 	"errors"
 	"io"
-	"log"
 	"net"
 	"net/textproto"
 	"strconv"
@@ -17,9 +16,16 @@ var ErrNotAMI = errors.New("Server not AMI interface")
 // Params for the actions
 type Params map[string]string
 
+// sub-interface that is user by this lib
+type MIMEReadWriteCloser interface {
+	PrintfLine(format string, args ...interface{}) error
+	ReadMIMEHeader() (textproto.MIMEHeader, error)
+	Close() error
+}
+
 // AMIClient a connection to AMI server
 type AMIClient struct {
-	conn *textproto.Conn
+	conn MIMEReadWriteCloser
 
 	address string
 	amiUser string
@@ -133,10 +139,8 @@ func (client *AMIClient) main() {
 			currentError = pendingError[0]
 			errors = client.Errors
 		}
-		log.Println("selecting")
 		select {
 		case errc, ok := <-client.closing:
-			log.Println("received close message", ok)
 			if ok {
 				err := client.conn.Close()
 				errc <- err
@@ -145,9 +149,11 @@ func (client *AMIClient) main() {
 			close(client.Events)
 			return
 		case data, ok := <-client.raw:
-			log.Println("received raw data", ok)
+			if !ok {
+				// client.raw got closed?
+				continue
+			}
 			if data.Get("Response") != "" {
-				log.Println("Received response", data)
 				if response, err := newResponse(&data); err == nil {
 					//TODO: will block whole server on bad consume
 					client.response[response.ID] <- response
@@ -165,10 +171,8 @@ func (client *AMIClient) main() {
 				}
 			}
 		case events <- currentEvent:
-			log.Println("sent current event")
 			pendingEvent = pendingEvent[1:]
 		case errors <- currentError:
-			log.Println("sent current error")
 			pendingError = pendingError[1:]
 		}
 	}
@@ -265,14 +269,11 @@ func (client *AMIClient) login(username, password string) error {
 
 // Close the connection to AMI
 func (client *AMIClient) Close() error {
-	log.Println("sending action")
 	if _, err := client.Action("Logoff", nil); err != nil {
 		return err
 	}
 	errc := make(chan error)
-	log.Println("sending errc to closing", errc)
 	client.closing <- errc
-	log.Println("waiting for error to be returned")
 	return <-errc
 }
 

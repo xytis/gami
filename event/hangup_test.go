@@ -3,7 +3,7 @@ package event
 import (
 	"testing"
 
-	"github.com/bit4bit/gami"
+	"github.com/xytis/gami"
 )
 
 func TestHangupEvent(t *testing.T) {
