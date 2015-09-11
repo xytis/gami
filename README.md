@@ -3,7 +3,7 @@ GAMI
 
 GO - Asterisk AMI Interface
 
-communicate with the  Asterisk AMI, Actions and Events.
+communicate with the Asterisk AMI, Actions and Events.
 
 Example connecting to Asterisk and Send Action get Events.
 
@@ -11,104 +11,78 @@ Example connecting to Asterisk and Send Action get Events.
 package main
 import (
 	"log"
-	"github.com/bit4bit/gami"
-	"github.com/bit4bit/gami/event"
+	"github.com/xytis/gami"
+	"github.com/xytis/gami/event"
 )
 
 func main() {
-	ami, err := gami.Dial("127.0.0.1:5038")
+	ami, err := gami.Connect("127.0.0.1:5038", "admin", "root")
 	if err != nil {
 		log.Fatal(err)
 	}
-	
+
 	//install manager
 	go func() {
 		for {
 			select {
-			//handle network errors
-			case err := <-ami.NetError:
-				log.Println("Network Error:", err)
-				//try new connection every second
-				<-time.After(time.Second)
-				if err := ami.Reconnect(); err == nil {
-					//call start actions
-					ami.Action("Events", gami.Params{"EventMask": "on"})
+			case ev, ok := <-ami.Events:
+				if !ok {
+					return
 				}
-				
-			case err := <-ami.Error:
-				log.Println("error:", err)
-			//wait events and process
-			case ev := <-ami.Events:
-				log.Println("Event Detect: %v", *ev)
-				//if want type of events
-				log.Println("EventType:", event.New(ev))
+				log.Println("received an event", ev, ok)
+				log.Println("event type:", event.New(ev))
+			case err, ok := <-ami.Errors:
+				log.Println("received an error", err, ok)
+			case fatal, ok := <-ami.Fatal:
+				log.Println("ami stack died with", fatal, ok)
+				log.Println("should try to recover...")
+				return
 			}
 		}
 	}()
-	
-	if err := ami.Login("admin", "root"); err != nil {
-		log.Fatal(err)
-	}
-	
-	
+
 	if rs, err = ami.Action("Ping", nil); err != nil {
 		log.Fatal(rs)
 	}
-	
+
 	//async actions
 	rsPing, rsErr := ami.AsyncAction("Ping", gami.Params{"ActionID": "pingo"})
 	if rsErr != nil {
 		log.Fatal(rsErr)
 	}
-						
+
 	if rs, err = ami.Action("Events", ami.Params{"EventMask":"on"}); err != nil {
 		log.Fatal(err)
 	}
-	
+
 	log.Println("ping:", <-rsPing)
-	
+
 	ami.Close()
 }
 ```
-
-###TLS SUPPORT
-In order to use TLS connection to manager interface you could `Dial` with additional parameters
-```go
-//without TLS
-ami, err := gami.Dial("127.0.0.1:5038")
-
-//if certificate is trusted
-ami, err := gami.Dial("127.0.0.1:5039", gami.UseTLS)
-
-//if self signed certificate
-ami, err := gami.Dial("127.0.0.1:5039", gami.UseTLS, gami.UnsecureTLS)
-```
-**WARNING:**
-*Only Asterisk >=1.6 supports TLS connection to AMI and
-it needs additional configuration(follow the [Asterisk AMI configuration](http://www.asteriskdocs.org/en/3rd_Edition/asterisk-book-html-chunk/AMI-configuration.html) documentation)*
 
 CURRENT EVENT TYPES
 ====
 
 The events use documentation and struct from *PAMI*.
 
-use **bit4bit/gami/event.New()** for get this struct from raw event
+use **xytis/gami/event.New()** for get this struct from raw event
 
-EVENT ID          | TYPE TEST  
-----------------  | ---------- 
-*Newchannel*      | YES
-*Newexten*        | YES
-*Newstate*        | YES 
-*Dial*            | YES 
-*ExtensionStatus* | YES 
-*Hangup*          | YES 
-*PeerStatus*      | YES
-*PeerEntry*	      | YES
-*VarSet*          | YES 
-*AgentLogin*      | YES
-*Agents*          | YES
-*AgentLogoff*     | YES
-*AgentConnect*    | YES
+EVENT ID           | TYPE TEST
+------------------ | ----------
+*Newchannel*       | YES
+*Newexten*         | YES
+*Newstate*         | YES
+*Dial*             | YES
+*ExtensionStatus*  | YES
+*Hangup*           | YES
+*PeerStatus*       | YES
+*PeerEntry*        | YES
+*VarSet*           | YES
+*AgentLogin*       | YES
+*Agents*           | YES
+*AgentLogoff*      | YES
+*AgentConnect*     | YES
 *RTPReceiverStats* | YES
-*RTPSenderStats* | YES
-*Bridge* | YES
+*RTPSenderStats*   | YES
+*Bridge*           | YES

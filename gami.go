@@ -1,15 +1,13 @@
 package gami
 
 import (
-	"crypto/tls"
 	"errors"
-	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/textproto"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -23,23 +21,20 @@ type Params map[string]string
 type AMIClient struct {
 	conn *textproto.Conn
 
-	address     string
-	amiUser     string
-	amiPass     string
-	amiAuth     bool
-	useTLS      bool
-	unsecureTLS bool
-	opNumber    int
-	opPrefix    string
+	address string
+	amiUser string
+	amiPass string
+
+	opNumber int
+	opPrefix string
 
 	raw      chan textproto.MIMEHeader
 	closing  chan chan error
-	events   chan *AMIEvent
-	errors   chan error
 	response map[string]chan *AMIResponse
 
-	Error    chan error
-	NetError chan error
+	Events chan *AMIEvent
+	Errors chan error
+	Fatal  chan error
 }
 
 // AMIResponse from action
@@ -109,107 +104,80 @@ func (client *AMIClient) Action(action string, params Params) (*AMIResponse, err
 	}
 }
 
-func (client *AMIClient) handleConnection(conn *textproto.Conn) {
-	client.raw = make(chan textproto.MIMEHeader)
-	go func() {
-		defer func() {
-			close(client.raw)
-		}()
-		for {
-			if data, err := conn.ReadMIMEHeader(); err != nil {
-				client.errors <- err
-				return
-			} else {
-				client.raw <- data
-			}
+func (client *AMIClient) poll() {
+	for {
+		if data, err := client.conn.ReadMIMEHeader(); err != nil {
+			//When underlying connection is closed, reader 'sometimes' returns EOF
+			client.Fatal <- err
+			close(client.closing)
+			return
+		} else {
+			client.raw <- data
 		}
-	}()
+	}
+}
+
+func (client *AMIClient) main() {
+	var pendingEvent []*AMIEvent
+	var pendingError []error
+	for {
+		var currentEvent *AMIEvent
+		var currentError error
+		var events chan *AMIEvent
+		var errors chan error
+		if len(pendingEvent) > 0 {
+			currentEvent = pendingEvent[0]
+			events = client.Events
+		}
+		if len(pendingError) > 0 {
+			currentError = pendingError[0]
+			errors = client.Errors
+		}
+		log.Println("selecting")
+		select {
+		case errc, ok := <-client.closing:
+			log.Println("received close message", ok)
+			if ok {
+				err := client.conn.Close()
+				errc <- err
+			}
+			//Closing to notify that we are offline
+			close(client.Events)
+			return
+		case data, ok := <-client.raw:
+			log.Println("received raw data", ok)
+			if data.Get("Response") != "" {
+				log.Println("Received response", data)
+				if response, err := newResponse(&data); err == nil {
+					//TODO: will block whole server on bad consume
+					client.response[response.ID] <- response
+					close(client.response[response.ID])
+					delete(client.response, response.ID)
+				} else {
+					pendingError = append(pendingError, err)
+				}
+			}
+			if data.Get("Event") != "" {
+				if event, err := newEvent(&data); err == nil {
+					pendingEvent = append(pendingEvent, event)
+				} else {
+					pendingError = append(pendingError, err)
+				}
+			}
+		case events <- currentEvent:
+			log.Println("sent current event")
+			pendingEvent = pendingEvent[1:]
+		case errors <- currentError:
+			log.Println("sent current error")
+			pendingError = pendingError[1:]
+		}
+	}
 }
 
 // Run process socket waiting events and responses
 func (client *AMIClient) run() {
-
-	//Chomping proc for printing runtime errors encountered
-	go func() {
-		for {
-			select {
-			case err, ok := <-client.errors:
-				if !ok {
-					return
-				}
-				fmt.Println(err)
-			}
-		}
-	}()
-
-	go func() {
-		var pendingEvent []*AMIEvent
-		var pendingError []error
-		for {
-			var currentEvent *AMIEvent
-			var currentError error
-			var events chan *AMIEvent
-			var errors chan error
-			if len(pendingEvent) > 0 {
-				currentEvent = pendingEvent[0]
-				events = client.events
-			}
-			if len(pendingError) > 0 {
-				currentError = pendingError[0]
-				errors = client.errors
-			}
-			select {
-			case errc := <-client.closing:
-				errc <- currentError
-				close(client.raw)
-				close(client.errors)
-				close(client.events)
-				return
-			case data := <-client.raw:
-				if data.Get("Response") != "" {
-					if response, err := newResponse(&data); err == nil {
-						//TODO: will block whole server on bad consume
-						client.response[response.ID] <- response
-						close(client.response[response.ID])
-						delete(client.response, response.ID)
-					} else {
-						pendingError = append(pendingError, err)
-					}
-				}
-				if data.Get("Event") != "" {
-					if event, err := newEvent(&data); err == nil {
-						pendingEvent = append(pendingEvent, event)
-					} else {
-						pendingError = append(pendingError, err)
-					}
-				}
-			case events <- currentEvent:
-				pendingEvent = pendingEvent[1:]
-			case errors <- currentError:
-				pendingError = pendingError[1:]
-			}
-		}
-	}()
-
-	client.handleConnection(client.conn)
-	go func() {
-		for err := range client.errors {
-			fmt.Println("connection error", err)
-			switch err {
-			case syscall.ECONNABORTED:
-				fallthrough
-			case syscall.ECONNRESET:
-				fallthrough
-			case syscall.ECONNREFUSED:
-				fallthrough
-			case io.EOF:
-				client.conn.Close()
-				client.NetError <- err
-			default:
-				client.Error <- err
-			}
-		}
-	}()
+	go client.main()
+	go client.poll()
 }
 
 //newResponse build a response for action
@@ -252,33 +220,35 @@ func newEvent(data *textproto.MIMEHeader) (*AMIEvent, error) {
 	return ev, nil
 }
 
-// Dial create a new connection to AMI
-func Dial(address string, options ...func(*AMIClient)) (client *AMIClient, err error) {
+// Create a new connection to AMI
+func Connect(address string, user string, secret string) (client *AMIClient, err error) {
 	client = &AMIClient{
-		address:     address,
-		amiUser:     "",
-		amiPass:     "",
-		opNumber:    0,
-		opPrefix:    "r",
-		response:    make(map[string]chan *AMIResponse),
-		events:      make(chan *AMIEvent),
-		Error:       make(chan error, 1),
-		NetError:    make(chan error, 1),
-		useTLS:      false,
-		unsecureTLS: false,
+		address:  address,
+		amiUser:  user,
+		amiPass:  secret,
+		opNumber: 0,
+		opPrefix: "r",
+
+		response: make(map[string]chan *AMIResponse),
+		raw:      make(chan textproto.MIMEHeader),
+		closing:  make(chan chan error),
+
+		Events: make(chan *AMIEvent),
+		Errors: make(chan error),
+		Fatal:  make(chan error),
 	}
-	for _, op := range options {
-		op(client)
-	}
-	if client.conn, err = client.newConn(); err != nil {
+	if err = client.bind(); err != nil {
 		return nil, err
 	}
 	client.run()
+	if user != "" {
+		return client, client.login(user, secret)
+	}
 	return client, nil
 }
 
 // Login authenticate to AMI
-func (client *AMIClient) Login(username, password string) error {
+func (client *AMIClient) login(username, password string) error {
 	response, err := client.Action("Login", Params{"Username": username, "Secret": password})
 	if err != nil {
 		return err
@@ -290,58 +260,41 @@ func (client *AMIClient) Login(username, password string) error {
 
 	client.amiUser = username
 	client.amiPass = password
-	client.amiAuth = true
-	return nil
-}
-
-// Reconnect the session, autologin if possible
-func (client *AMIClient) Reconnect() (err error) {
-	client.conn.Close()
-	if client.conn, err = client.newConn(); err != nil {
-		return err
-	}
-
-	if client.amiAuth {
-		if err = client.Login(client.amiUser, client.amiPass); err != nil {
-			return err
-		}
-	}
-
-	client.run()
-
 	return nil
 }
 
 // Close the connection to AMI
 func (client *AMIClient) Close() error {
-	client.Action("Logoff", nil)
+	log.Println("sending action")
+	if _, err := client.Action("Logoff", nil); err != nil {
+		return err
+	}
 	errc := make(chan error)
+	log.Println("sending errc to closing", errc)
 	client.closing <- errc
+	log.Println("waiting for error to be returned")
 	return <-errc
 }
 
-// NewConn create a new connection to AMI
-func (client *AMIClient) newConn() (conn *textproto.Conn, err error) {
+//  create a new connection to AMI
+func (client *AMIClient) bind() (err error) {
 	var rwc io.ReadWriteCloser
-	if client.useTLS {
-		rwc, err = tls.Dial("tcp", client.address, &tls.Config{InsecureSkipVerify: client.unsecureTLS})
-	} else {
-		rwc, err = net.Dial("tcp", client.address)
-	}
+	rwc, err = net.Dial("tcp", client.address)
 
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	conn = textproto.NewConn(rwc)
+	conn := textproto.NewConn(rwc)
 	label, err := conn.ReadLine()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	if strings.Contains(label, "Asterisk Call Manager") != true {
-		return nil, ErrNotAMI
+		return ErrNotAMI
 	}
 
-	return conn, nil
+	client.conn = conn
+	return nil
 }
