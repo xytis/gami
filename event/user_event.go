@@ -4,7 +4,7 @@ package event
 // A user defined event raised from the dialplan.
 type UserEvent struct {
 	Privilege []string
-	UserEvent string `AMI:"UserEvent"`
+	UserEvent string `AMI:"Userevent"`
 	UniqueID  string `AMI:"Uniqueid"`
 }
 

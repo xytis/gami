@@ -8,7 +8,7 @@ import (
 
 func TestUserEventEvent(t *testing.T) {
 	fixture := map[string]string{
-		"UserEvent": "UserEvent",
+		"Userevent": "UserEvent",
 		"Uniqueid":  "UniqueID",
 	}
 
